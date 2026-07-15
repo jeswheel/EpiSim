@@ -1,0 +1,194 @@
+---
+title: "Designing and fitting models: A Zombie Apocolypse"
+author:
+  - Jesse Wheeler
+  - Qianying (Ruby) Lin
+  - Spencer J. Fox
+format: 
+  beamer:
+    classoption: "t"
+    # fontsize: "11pt"
+    link-citations: true
+    keep_tex: true
+    slide_level: 2
+    section-titles: false
+    aspectratio: 169
+    include-in-header: "../_includes/header.tex"
+    # beameroptions:
+    #   - setbeamertemplate: "footline[frame number]"
+    #   - setbeamertemplate: "navigation symbols{}"
+    header-includes: |
+       \setbeamertemplate{navigation symbols}{}
+       \setbeamertemplate{footline}[page number]
+    hyperrefoptions:
+      - linktoc=all
+  html:
+    toc: true
+  pdf:
+    toc: true
+editor_options: 
+  chunk_output_type: console
+bibliography: ["../sbied.bib"]
+---
+
+```{r knitr_opts,include=FALSE,cache=FALSE,purl=FALSE}
+source("../_includes/setup.R", local = knitr::knit_global())
+
+```
+
+```{r prelims,echo=F,cache=F}
+library(foreach)
+library(iterators)
+library(doFuture)
+library(tidyverse)
+library(microbenchmark)
+library(pomp)
+plan(multisession)
+
+```
+
+## Recap: Euler-Binomial Scheme
+
+We previously considered continuous time models with a simple, one-option flow:
+
+$$S \rightarrow E \rightarrow I \rightarrow R$$
+
+We did this by turning continuous transition rates $\mu_{SE}$ into transition probabilities over a small time step $dt$:
+
+$$N_{SE}(t) \sim \text{Binom}\big(S(t), 1 - e^{-\mu_{SE}\times dt}\big)$$
+
+```{c eval=FALSE}
+double p = 1 - exp(-mu_SE * dt);
+double trans_SE = rbinom(S, p); // Draw from Susceptible pool
+S -= trans_SE;
+E += trans_SE;
+
+```
+
+This works perfectly when there is only **one** way out of a compartment.
+
+## The Problem: Competing Risks
+
+What happens when an individual can exit a compartment in multiple ways?
+Consider a model where an exposed individual may become either **symptomatic** ($I$), or **asymptomatic** ($A$):
+
+$$S \rightarrow E  \,\,\begin{matrix}  \nearrow \\ \searrow  \end{matrix}\,\begin{matrix}  A \\ \\ I  \end{matrix}\,\begin{matrix}  \searrow \\ \nearrow  \end{matrix}\,\, R$$
+
+If we use sequential `rbinom` draws, **the first draw always gets priority**, creating a mathematical bias:
+
+```{c eval=FALSE}
+double trans_I = rbinom(E, p_I);
+// Bias! Asymptomatic draw is artificially restricted by the first draw
+double trans_A = rbinom(E - trans_I, p_A); 
+```
+
+## Euler-Multinomial Distribution
+
+To avoid this bias, we need to draw both transitions at the same time. We can handle convert rates into probabilities, and do simultaneous draws, with a single distribution: **Euler-Multinomial**.
+
+\vspace{2cm}
+
+This is a natural extension of the process of converting continuous-time rates to probabilities, and doing binomial draws, which has two options: staying in $E$, or going to $I$. 
+
+Now, we may have 3 options: Staying in $E$, going to $I$, or going to $A$:
+
+$$
+\big(N_{EI}(t), N_{EA}(t)) \sim \text{EulerMultinom}\big[E(t), (\mu_{EI}(t), \mu_{EA}(t))\big]
+$$
+
+## `reulermultinom` in practice
+
+The `reulermultinom` function does this for us. It calculates the total exits based on the sum of all rates, then correctly distributes them.
+
+```{c eval=FALSE}
+// 1. Arrays for rates and output
+double rates[2] = {mu_EI, mu_EA};
+double trans[2];
+
+// 2. Draw simultaneously
+// (num_paths, size, &rates, dt, &trans)
+reulermultinom(2, E, &rates[0], dt, &trans[0]);
+
+// 3. Extract results
+double trans_I = trans[0];
+double trans_A = trans[1];
+```
+
+*Note: The `&` symbol just tells C exactly where your lists are stored in memory.*
+
+## Introduction {.allowframebreaks}
+
+* Our goal: practice what we learned, design a model and make predictions.
+* **Scenario**: A zombie-apocalyptic infection has spread on a small island nation.
+* Simulated data available on course website: weekly data for 1.5 years
+
+```{r, echo=FALSE, fig.height=2}
+zombie_df <- read.csv('raw-data/zombieCases.csv')
+ggplot(zombie_df, aes(x = time, y = cases)) + 
+  geom_line() + 
+  geom_point() + 
+  theme_bw()
+
+```
+
+## Goals
+
+* Fit a model
+* Estimate number of surviving humans, forecasts, etc.
+
+# Part 1: The Scenario & Conceptual Model
+
+## The Anomaly
+
+* **The Setup:** Public health officials are tracking a bizarre neurological outbreak (colloquially "Zombies").
+* **The Hypothesis:** The pathogen circulated completely undetected for 2 months ($t < 60$) causing no reportable symptoms. At Day 60, it mutated.
+* **The Mutation:** A high (unknown) percentage of exposed individuals turn into aggressive Zombies; the remaining proportion develop a rash and become permanently immune.
+* **Spread:** The virus spreads from contacts between current zombies + exposed individuals and susceptible survivors.
+* **Containment:** Zombies do not die naturally. They are destroyed via mass-action combat driven by surviving humans (Susceptible + Immune).
+
+## The Fog of War (Measurement Model)
+
+* We only partially observe total zombies, though reporting is high.
+* The exposed class (those that may become zombies) is completely invisible.
+* Reporting infrastructure decays (exponentially) as the total zombie horde ($Z$) grows.
+
+## Model building
+
+* What compartments should we include based on what we know? 
+* New infections follow similar dynamics relative to what we have seen. What about the mass-action combat destruction of zombies?
+* Modeling and forecasting long periods. Should we include births / deaths?
+
+## Independent Exercise: Map the Competing Risks (15 mins)
+
+**On Paper or Whiteboard:**
+Map the transition flow for this system. Pay special attention to competing risks (arrows leaving the same box).
+
+1. What are the two exit pathways for a Susceptible ($S$) individual?
+2. What are the three exit pathways for an Exposed ($E$) individual?
+3. If $R$ holds dead bodies and destroyed zombies, do they contribute to the birth rate ($\mu_b$)?
+4. Should $R$ be in the transmission denominator ($N$)? Why or why not?
+
+# Part 2: Building the POMP Object
+
+## Independent Exercise: Build the Model (45 mins)
+
+**Your Task:** Work in your groups to translate your conceptual model into `pomp` C-snippets.
+
+1. Write `rinit`, `rprocess`, `rmeasure`, and `dmeasure` snippets.
+2. Build the `pomp` object.
+3. Choose a reasonable set of starting parameters and use `simulate()` to ensure your model produces an outbreak curve that roughly matches the shape of the data.
+
+# Part 3: Inference and Forecasting
+
+## Estimation with Iterated Filtering
+
+The dataset contains a massive gap: the first two months of the outbreak are entirely unobserved.
+
+**The Challenge:**
+When you run `mif2`, the particles must correctly estimate the early, silent transmission rate ($\beta_E$) based *only* on the magnitude of the zombie explosion that happens weeks later.
+
+## Independent Exercise: Estimation & The Doomsday Forecast (60 mins)
+
+1. **Estimation:** Run `mif2` to estimate the transmission rates ($\beta_E, \beta_Z$), the combat effectiveness ($\alpha$), and the immunity fraction ($\omega$). Plot your convergence traces.
+2. **Forecasting:** Extract your best parameter estimates. Use `simulate()` to generate 50 forward trajectories extending 10 years into the future.
+3. **Discussion:** Look at your simulated trajectories for the Susceptible ($S$) compartment. Does the human-driven combat mechanic allow humanity to bounce back, or does the dropping population trigger a runaway collapse?
